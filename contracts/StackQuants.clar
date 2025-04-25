@@ -193,3 +193,153 @@
         (ok true)
     )
 )
+
+(define-public (update-resource-price (resource-type-identifier uint) (new-price uint))
+    (let (
+        (resource-info (unwrap! (map-get? registered-resource-types resource-type-identifier) ERROR_RESOURCE_TYPE_NOT_FOUND))
+    )
+        (asserts! (is-contract-administrator) ERROR_UNAUTHORIZED_ACCESS)
+        (asserts! (is-valid-resource-quantity new-price) ERROR_INVALID_RESOURCE_QUANTITY)
+        (asserts! (does-resource-type-exist resource-type-identifier) ERROR_RESOURCE_TYPE_NOT_FOUND)
+
+        (try! (update-price-history resource-type-identifier new-price))
+
+        (map-set registered-resource-types resource-type-identifier 
+            (merge resource-info {
+                current-price-per-unit: new-price,
+                price-update-timestamp: block-height
+            })
+        )
+        (ok true)
+    )
+)
+
+;; Account Management Functions
+(define-public (update-account-role (account-address principal) (new-role (string-ascii 20)))
+    (begin
+        (asserts! (is-contract-administrator) ERROR_UNAUTHORIZED_ACCESS)
+        (asserts! (is-valid-address account-address) ERROR_INVALID_PARAMETERS)
+        (asserts! (or (is-eq new-role "ADMIN") (is-eq new-role "PREMIUM") (is-eq new-role "BUSINESS") (is-eq new-role "VERIFIED") (is-eq new-role "USER")) ERROR_INVALID_PARAMETERS)
+        (map-set account-authorization-levels account-address new-role)
+        (ok true)
+    )
+)
+
+(define-public (restrict-account (account-address principal))
+    (begin
+        (asserts! (is-contract-administrator) ERROR_UNAUTHORIZED_ACCESS)
+        (asserts! (is-valid-address account-address) ERROR_INVALID_PARAMETERS)
+        (asserts! (not (is-eq account-address CONTRACT_ADMINISTRATOR)) ERROR_INVALID_PARAMETERS)
+        (map-set restricted-accounts account-address true)
+        (ok true)
+    )
+)
+
+(define-public (remove-account-restriction (account-address principal))
+    (begin
+        (asserts! (is-contract-administrator) ERROR_UNAUTHORIZED_ACCESS)
+        (asserts! (is-valid-address account-address) ERROR_INVALID_PARAMETERS)
+        (map-set restricted-accounts account-address false)
+        (ok true)
+    )
+)
+
+;; Resource Allocation Functions
+(define-public (submit-allocation-request 
+    (resource-type-identifier uint) 
+    (requested-quantity uint)
+    (allocation-purpose (string-ascii 128)))
+    (let (
+        (resource-info (unwrap! (map-get? registered-resource-types resource-type-identifier) ERROR_RESOURCE_TYPE_NOT_FOUND))
+        (new-request-id (+ (var-get allocation-request-counter) u1))
+        (requester-priority (get-account-priority-level tx-sender))
+    )
+        (asserts! (not (var-get resource-system-frozen)) ERROR_UNAUTHORIZED_ACCESS)
+        (asserts! (not (var-get system-under-maintenance)) ERROR_UNAUTHORIZED_ACCESS)
+        (asserts! (is-account-authorized tx-sender) ERROR_UNAUTHORIZED_ACCESS)
+        (asserts! (not (get resource-frozen-status resource-info)) ERROR_RESOURCE_FROZEN)
+        (asserts! (is-valid-resource-quantity requested-quantity) ERROR_INVALID_RESOURCE_QUANTITY)
+        (asserts! (<= requested-quantity (get current-available-supply resource-info)) ERROR_INSUFFICIENT_RESOURCE_BALANCE)
+        (asserts! (>= requested-quantity (get minimum-allocation-amount resource-info)) ERROR_INVALID_RESOURCE_QUANTITY)
+        (asserts! (<= requested-quantity (get maximum-allocation-amount resource-info)) ERROR_RESOURCE_ALLOCATION_EXCEEDED)
+        (asserts! (>= requester-priority (get required-access-level resource-info)) ERROR_UNAUTHORIZED_ACCESS)
+        (asserts! (>= (len allocation-purpose) u1) ERROR_INVALID_PARAMETERS)
+
+        (map-set resource-allocation-requests new-request-id {
+            requester-address: tx-sender,
+            allocation-amount: requested-quantity,
+            target-resource-type: resource-type-identifier,
+            request-current-status: "PENDING",
+            requester-priority-level: requester-priority,
+            submission-timestamp: block-height,
+            request-expiration-time: (+ block-height u144), ;; 24 hour expiration
+            allocation-justification: allocation-purpose
+        })
+        (var-set allocation-request-counter new-request-id)
+        (ok new-request-id)
+    )
+)
+
+(define-public (transfer-resources (recipient principal) (resource-type-identifier uint) (transfer-amount uint))
+    (let (
+        (sender-balance (get-account-balance tx-sender))
+        (recipient-balance (get-account-balance recipient))
+        (resource-info (unwrap! (map-get? registered-resource-types resource-type-identifier) ERROR_RESOURCE_TYPE_NOT_FOUND))
+    )
+        (asserts! (not (var-get resource-system-frozen)) ERROR_UNAUTHORIZED_ACCESS)
+        (asserts! (is-account-authorized tx-sender) ERROR_UNAUTHORIZED_ACCESS)
+        (asserts! (is-account-authorized recipient) ERROR_INVALID_RECIPIENT)
+        (asserts! (<= transfer-amount sender-balance) ERROR_INSUFFICIENT_RESOURCE_BALANCE)
+        (asserts! (not (get resource-frozen-status resource-info)) ERROR_RESOURCE_FROZEN)
+        (asserts! (is-valid-address recipient) ERROR_INVALID_PARAMETERS)
+
+        (map-set account-resource-balances tx-sender (- sender-balance transfer-amount))
+        (map-set account-resource-balances recipient (+ recipient-balance transfer-amount))
+        (ok true)
+    )
+)
+
+;; Emergency Functions
+(define-public (enable-maintenance-mode)
+    (begin
+        (asserts! (is-contract-administrator) ERROR_UNAUTHORIZED_ACCESS)
+        (var-set system-under-maintenance true)
+        (var-set resource-system-frozen true)
+        (ok true)
+    )
+)
+
+(define-public (disable-maintenance-mode)
+    (begin
+        (asserts! (is-contract-administrator) ERROR_UNAUTHORIZED_ACCESS)
+        (var-set system-under-maintenance false)
+        (var-set resource-system-frozen false)
+        (ok true)
+    )
+)
+
+(define-public (freeze-resource (resource-type-identifier uint))
+    (let (
+        (resource-info (unwrap! (map-get? registered-resource-types resource-type-identifier) ERROR_RESOURCE_TYPE_NOT_FOUND))
+    )
+        (asserts! (is-contract-administrator) ERROR_UNAUTHORIZED_ACCESS)
+        (asserts! (does-resource-type-exist resource-type-identifier) ERROR_RESOURCE_TYPE_NOT_FOUND)
+        (map-set registered-resource-types resource-type-identifier 
+            (merge resource-info { resource-frozen-status: true })
+        )
+        (ok true)
+    )
+)
+
+(define-public (unfreeze-resource (resource-type-identifier uint))
+    (let (
+        (resource-info (unwrap! (map-get? registered-resource-types resource-type-identifier) ERROR_RESOURCE_TYPE_NOT_FOUND))
+    )
+        (asserts! (is-contract-administrator) ERROR_UNAUTHORIZED_ACCESS)
+        (asserts! (does-resource-type-exist resource-type-identifier) ERROR_RESOURCE_TYPE_NOT_FOUND)
+        (map-set registered-resource-types resource-type-identifier 
+            (merge resource-info { resource-frozen-status: false })
+        )
+        (ok true)
+    )
+)
